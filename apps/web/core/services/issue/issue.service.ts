@@ -107,7 +107,10 @@ export class IssueService extends APIService {
       });
   }
 
-  async createWorkspaceIssueType(workspaceSlug: string, data: { name: string; color: string; description?: string }): Promise<any> {
+  async createWorkspaceIssueType(
+    workspaceSlug: string,
+    data: { name: string; color: string; description?: string }
+  ): Promise<any> {
     return this.post(`/api/workspaces/${workspaceSlug}/issue-types/`, data)
       .then((response) => response?.data)
       .catch((error) => {
@@ -291,6 +294,19 @@ export class IssueService extends APIService {
 
   async deleteIssue(workspaceSlug: string, projectId: string, issuesId: string): Promise<any> {
     return this.delete(`/api/workspaces/${workspaceSlug}/projects/${projectId}/${this.serviceType}/${issuesId}/`)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  // Questimus fork change (QUESTIMUS-30): move a work item (and its whole
+  // sub-tree) to another project. Response is the moved root issue serialized
+  // with its new project_id/sequence_id.
+  async moveIssue(workspaceSlug: string, projectId: string, issueId: string, targetProjectId: string): Promise<TIssue> {
+    return this.post(`/api/workspaces/${workspaceSlug}/projects/${projectId}/issues/${issueId}/move/`, {
+      target_project_id: targetProjectId,
+    })
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;
