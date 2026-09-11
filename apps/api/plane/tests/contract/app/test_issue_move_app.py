@@ -12,8 +12,9 @@ its whole descendant subtree — into another project of the same workspace:
   source IssueSequence row kept, new destination row created;
 - state remap (same-name state in the destination, then destination default,
   then first non-triage destination state);
-- label/assignee filtering (workspace labels and destination-project labels /
-  active destination members role >= 15 are kept, everything else dropped);
+- label handling (workspace labels untouched, source-project labels cloned
+  into the destination and the moved issues re-pointed to the clones — unless
+  a same-named destination label exists, then merged onto it);
 - an IssueActivity row (verb="updated", field="project") recording the move.
 
 Errors: 403 when the caller is not an active role >= 15 member of the
@@ -181,13 +182,20 @@ class TestIssueMove:
         assert new_rows.first().sequence == root.sequence_id
 
         # Labels: workspace label survives under the destination project,
-        # source-project label is adopted (its Label row re-pointed).
+        # source-project label is CLONED into the destination and the moved
+        # item re-pointed to the clone (the original label row stays behind
+        # for source issues that share it).
         kept_label_row = IssueLabel.objects.filter(issue_id=root.id, label_id=ws_label.id).first()
         assert kept_label_row is not None
         assert kept_label_row.project_id == project_b.id
-        adopted_label = Label.objects.get(pk=src_label.id)
-        assert adopted_label.project_id == project_b.id
-        assert IssueLabel.objects.filter(issue_id=root.id, label_id=src_label.id).exists()
+        cloned_label = Label.objects.filter(project_id=project_b.id, name=src_label.name).first()
+        assert cloned_label is not None
+        assert cloned_label.pk != src_label.id
+        assert cloned_label.project_id == project_b.id
+        moved_src_label_row = IssueLabel.objects.filter(issue_id=root.id, label_id=cloned_label.id).first()
+        assert moved_src_label_row is not None
+        assert moved_src_label_row.project_id == project_b.id
+        assert Label.objects.get(pk=src_label.id).project_id == project_a.id
 
         # Assignees: destination member kept (row points at destination),
         # non-member dropped.
@@ -629,8 +637,9 @@ class TestIssueMove:
         )
         assert response.status_code == status.HTTP_200_OK, response.data
         data = response.data
-        # workspace label kept + source label adopted
-        assert set(data["label_ids"]) == {str(ws_label.id), str(src_label.id)}
+        # workspace label kept + source label CLONED into the destination
+        cloned_label = Label.objects.get(project_id=project_b.id, name="Src2")
+        assert set(data["label_ids"]) == {str(ws_label.id), str(cloned_label.id)}
         assert set(data["assignee_ids"]) == {str(kept_user.id)}
         assert data["estimate_point"] is None
         assert data["sort_order"] > dst_done_existing.sort_order
@@ -765,11 +774,11 @@ class TestIssueMove:
     def test_move_drops_source_label_on_name_collision(
         self, session_client, workspace, project_a, project_b
     ):
-        """When the destination already has a same-named label, the source
-        label's bridge row is dropped instead of adopted (unique (project,
-        name) constraint)."""
+        """When the destination already has a same-named label, the moved
+        issues are merged onto that existing label (unique (project, name)
+        constraint; the source label row stays behind untouched)."""
         src_label = Label.objects.create(workspace=workspace, project=project_a, name="Collide")
-        Label.objects.create(workspace=workspace, project=project_b, name="Collide")
+        dest_twin = Label.objects.create(workspace=workspace, project=project_b, name="Collide")
 
         src_state = make_state("Todo", project_a, workspace, group="unstarted")
         root = make_issue("Collision label", project_a, workspace, state=src_state)
@@ -781,5 +790,44 @@ class TestIssueMove:
             format="json",
         )
         assert response.status_code == status.HTTP_200_OK, response.data
+        moved_bridge = IssueLabel.objects.filter(issue_id=root.id, label_id=dest_twin.id).first()
+        assert moved_bridge is not None
+        assert moved_bridge.project_id == project_b.id
         assert not IssueLabel.objects.filter(issue_id=root.id, label_id=src_label.id).exists()
         assert Label.objects.get(pk=src_label.id).project_id == project_a.id
+
+    @pytest.mark.django_db
+    def test_move_label_clone_keeps_shared_source_label(
+        self, session_client, workspace, project_a, project_b
+    ):
+        """Cloning a moved item's label must not disturb source issues that
+        share it: the stay-behind issue keeps its binding to the original
+        label row in the source project."""
+        src_state = make_state("Todo", project_a, workspace, group="unstarted")
+        root = make_issue("Moves with label", project_a, workspace, state=src_state)
+        stays = make_issue("Stays with label", project_a, workspace, state=src_state)
+        shared_label = Label.objects.create(workspace=workspace, project=project_a, name="Shared")
+        IssueLabel.objects.create(issue=root, label=shared_label, project=project_a)
+        IssueLabel.objects.create(issue=stays, label=shared_label, project=project_a)
+
+        response = session_client.post(
+            move_url(workspace.slug, project_a.id, root.id),
+            {"target_project_id": str(project_b.id)},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.data
+
+        # The moved issue points at a CLONE in the destination project.
+        moved_bridge = IssueLabel.objects.filter(issue_id=root.id).first()
+        assert moved_bridge is not None
+        moved_label = Label.objects.get(pk=moved_bridge.label_id)
+        assert moved_label.name == "Shared"
+        assert moved_label.project_id == project_b.id
+        assert moved_label.pk != shared_label.pk
+
+        # The stay-behind issue keeps its binding to the ORIGINAL label row,
+        # still scoped to the source project.
+        stays_bridge = IssueLabel.objects.filter(issue_id=stays.id).first()
+        assert stays_bridge is not None
+        assert stays_bridge.label_id == shared_label.id
+        assert Label.objects.get(pk=shared_label.id).project_id == project_a.id

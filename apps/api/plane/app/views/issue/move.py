@@ -74,6 +74,7 @@ from plane.db.models import (
 # import it from its defining module.
 from plane.db.models.issue import IssueAttachment
 from plane.db.models.issue_type import ProjectIssueType
+from plane.utils.exception_logger import log_exception
 from plane.utils.host import base_host
 from plane.utils.uuid import convert_uuid_to_integer
 
@@ -201,7 +202,10 @@ class IssueMoveEndpoint(BaseAPIView):
     @allow_permission([ROLE.ADMIN, ROLE.MEMBER])
     def post(self, request, slug, project_id, issue_id):
         # --- Payload -------------------------------------------------------
-        target_project_id = request.data.get("target_project_id", None)
+        # A JSON non-object body (list/str) makes request.data a non-dict;
+        # guard so .get cannot raise an unhandled AttributeError (500).
+        payload = request.data if isinstance(request.data, dict) else {}
+        target_project_id = payload.get("target_project_id", None)
         if not target_project_id:
             return Response(
                 {"error": "target_project_id is required"},
@@ -234,49 +238,7 @@ class IssueMoveEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --- Destination membership (allow_permission covers only the source) -
-        if not ProjectMember.objects.filter(
-            project_id=target_project.id,
-            member=request.user,
-            role__gte=15,
-            is_active=True,
-        ).exists():
-            return Response(
-                {"error": "You don't have the required permissions."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
-        # --- Source issue ----------------------------------------------------
-        issue = _annotate_issue_queryset(
-            Issue.all_objects.filter(
-                pk=issue_id, project_id=project_id, workspace__slug=slug, deleted_at__isnull=True
-            )
-        ).first()
-        if issue is None:
-            return Response({"error": "Issue not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        if issue.archived_at is not None:
-            return Response(
-                {"error": "Archived issues cannot be moved"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if IntakeIssue.objects.filter(issue_id=issue.id).exists():
-            return Response(
-                {"error": "Issues submitted through intake cannot be moved"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        # The destination must have at least one non-triage state; otherwise the
-        # state remap has nothing to resolve to and a moved issue would end up
-        # state-less while keeping its completed_at (review REAL-6).
-        if not State.objects.filter(project_id=target_project.id).exists():
-            return Response(
-                {"error": "Destination project does not have any states configured"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        current_instance = json.dumps(IssueSerializer(issue).data, cls=DjangoJSONEncoder)
+        current_instance = None
 
         with transaction.atomic():
             # Destination-project advisory lock (same pattern as Issue.save):
@@ -292,6 +254,52 @@ class IssueMoveEndpoint(BaseAPIView):
                     ]
                 ):
                     cursor.execute("SELECT pg_advisory_xact_lock(%s)", [lock_key])
+
+            # --- Authorization + state re-validation under the locks -----------
+            # (security review: a concurrent move can relocate the same issue
+            # between the pre-checks and this point; everything below must be
+            # decided against the post-lock state of the database.)
+            if not ProjectMember.objects.filter(
+                project_id=target_project.id,
+                member=request.user,
+                role__gte=15,
+                is_active=True,
+            ).exists():
+                return Response(
+                    {"error": "You don't have the required permissions."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            issue = _annotate_issue_queryset(
+                Issue.all_objects.filter(
+                    pk=issue_id, project_id=project_id, workspace__slug=slug, deleted_at__isnull=True
+                )
+            ).first()
+            if issue is None:
+                return Response({"error": "Issue not found"}, status=status.HTTP_404_NOT_FOUND)
+
+            if issue.archived_at is not None:
+                return Response(
+                    {"error": "Archived issues cannot be moved"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if IntakeIssue.objects.filter(issue_id=issue.id).exists():
+                return Response(
+                    {"error": "Issues submitted through intake cannot be moved"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # The destination must have at least one non-triage state; otherwise
+            # the state remap has nothing to resolve to and a moved issue would
+            # end up state-less while keeping its completed_at (review REAL-6).
+            if not State.objects.filter(project_id=target_project.id).exists():
+                return Response(
+                    {"error": "Destination project does not have any states configured"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            current_instance = json.dumps(IssueSerializer(issue).data, cls=DjangoJSONEncoder)
 
             moving_ids = _collect_descendant_ids(issue.id)
             moved_issues = list(
@@ -373,33 +381,49 @@ class IssueMoveEndpoint(BaseAPIView):
             #    already scoped to the destination stay untouched. Label
             #    hierarchy parents not attached to a moved issue stay in the
             #    source (cosmetic cross-project parent; acceptable).
-            IssueLabel.objects.filter(issue_id__in=moving_ids).filter(
-                label__project_id=source_project.id
-            ).filter(
-                label__name__in=Label.objects.filter(
-                    project_id=target_project.id, deleted_at__isnull=True
-                ).values("name")
-            ).delete()
-            source_label_ids = list(
-                IssueLabel.objects.filter(issue_id__in=moving_ids)
-                .filter(label__project_id=source_project.id)
-                .values_list("label_id", flat=True)
-            )
-            if source_label_ids:
-                # Destination labels sharing a name with a source label block
-                # adoption: their bridge rows were already dropped above.
-                colliding_label_ids = set(
-                    Label.objects.filter(
-                        project_id=target_project.id,
-                        deleted_at__isnull=True,
-                        name__in=Label.objects.filter(pk__in=source_label_ids).values("name"),
-                    )
-                    .exclude(pk__in=source_label_ids)
-                    .values_list("id", flat=True)
+            # 5. Labels: workspace-level labels stay as-is. Project labels of
+            #    the source project travel with the moved items via CLONES:
+            #    a destination Label row is created with the same name/color
+            #    and only the moved issues' bridge rows are re-pointed to it —
+            #    the original label row stays behind, so source issues that
+            #    share the label keep it (security review: re-pointing the
+            #    shared row stripped the label from non-moved source issues).
+            #    If the destination already has a same-named label, the moved
+            #    issues are merged onto it instead (no duplicates).
+            source_label_ids = sorted(
+                set(
+                    IssueLabel.objects.filter(issue_id__in=moving_ids)
+                    .filter(label__project_id=source_project.id, label__deleted_at__isnull=True)
+                    .values_list("label_id", flat=True)
                 )
-                adopted_label_ids = [i for i in source_label_ids if i not in colliding_label_ids]
-                if adopted_label_ids:
-                    Label.objects.filter(pk__in=adopted_label_ids).update(project_id=target_project.id)
+            )
+            label_id_map = {}
+            for source_label_id in source_label_ids:
+                source_label = Label.objects.get(pk=source_label_id)
+                twin = Label.objects.filter(
+                    project_id=target_project.id, deleted_at__isnull=True, name=source_label.name
+                ).first()
+                if twin is not None:
+                    # Merge onto the destination twin.
+                    label_id_map[source_label_id] = twin.id
+                    IssueLabel.objects.filter(issue_id__in=moving_ids, label_id=source_label_id).update(
+                        label_id=twin.id
+                    )
+                else:
+                    # Clone into the destination; keep the hierarchy when the
+                    # parent label is also travelling.
+                    clone = Label.objects.create(
+                        workspace_id=target_project.workspace_id,
+                        project_id=target_project.id,
+                        name=source_label.name,
+                        description=source_label.description,
+                        color=source_label.color,
+                        parent_id=label_id_map.get(source_label.parent_id),
+                    )
+                    label_id_map[source_label_id] = clone.id
+                    IssueLabel.objects.filter(issue_id__in=moving_ids, label_id=source_label_id).update(
+                        label_id=clone.id
+                    )
             IssueLabel.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
 
             # 6. Assignees: keep only active destination members (role >= 15).
@@ -524,36 +548,42 @@ class IssueMoveEndpoint(BaseAPIView):
                 epoch=int(timezone.now().timestamp()),
             )
 
-        # 11. Activity + webhook tasks (per IssueViewSet.partial_update).
+        # 11. Activity/webhook/version side effects run AFTER the transaction
+        #     has committed: a failure here must never turn a completed move
+        #     into a 500 (the user would retry an already-moved issue and hit
+        #     404s). Log and return the success response regardless
+        #     (error-handling review).
         requested_data = json.dumps(request.data, cls=DjangoJSONEncoder)
-        issue_activity.delay(
-            type="issue.activity.updated",
-            requested_data=requested_data,
-            actor_id=str(request.user.id),
-            issue_id=str(root.id),
-            project_id=str(target_project.id),
-            current_instance=current_instance,
-            epoch=int(timezone.now().timestamp()),
-            notification=True,
-            origin=base_host(request=request, is_app=True),
-        )
-        model_activity.delay(
-            model_name="issue",
-            model_id=str(root.id),
-            requested_data=request.data,
-            current_instance=current_instance,
-            actor_id=request.user.id,
-            slug=slug,
-            origin=base_host(request=request, is_app=True),
-        )
-
-        # 11. Version history: IssueVersion.log_issue_version is broken upstream
-        #     (never passes project/workspace and silently swallows the error);
-        #     create_issue_version only builds the row (the sync task bulk-creates
-        #     it), so persist the constructed instance here (review REAL-2).
-        _version = create_issue_version(root, get_related_data([root.id]))
-        if _version is not None:
-            _version.save()
+        try:
+            issue_activity.delay(
+                type="issue.activity.updated",
+                requested_data=requested_data,
+                actor_id=str(request.user.id),
+                issue_id=str(root.id),
+                project_id=str(target_project.id),
+                current_instance=current_instance,
+                epoch=int(timezone.now().timestamp()),
+                notification=True,
+                origin=base_host(request=request, is_app=True),
+            )
+            model_activity.delay(
+                model_name="issue",
+                model_id=str(root.id),
+                requested_data=request.data,
+                current_instance=current_instance,
+                actor_id=request.user.id,
+                slug=slug,
+                origin=base_host(request=request, is_app=True),
+            )
+            # Version history: IssueVersion.log_issue_version is broken upstream
+            # (never passes project/workspace and silently swallows the error);
+            # create_issue_version only builds the row (the sync task bulk-creates
+            # it), so persist the constructed instance here (review REAL-2).
+            _version = create_issue_version(root, get_related_data([root.id]))
+            if _version is not None:
+                _version.save()
+        except Exception as e:
+            log_exception(e)
 
         root = _annotate_issue_queryset(
             Issue.all_objects.filter(pk=root.id, deleted_at__isnull=True)
