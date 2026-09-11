@@ -81,6 +81,17 @@ from plane.utils.uuid import convert_uuid_to_integer
 from .. import BaseAPIView
 
 
+def _chunked(ids, size=10000):
+    """Yield successive fixed-size chunks from a list of ids.
+
+    Keeps IN-lists below the PostgreSQL bind-parameter limit for very large
+    subtrees (adversarial review F1).
+    """
+    ids = list(ids)
+    for start in range(0, len(ids), size):
+        yield ids[start : start + size]
+
+
 def _collect_descendant_ids(root_id):
     """Return [root, ...descendants] with parents before their children.
 
@@ -220,10 +231,25 @@ class IssueMoveEndpoint(BaseAPIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Adversarial review F3: same archive/deletion guard for the target.
+        if target_project.archived_at is not None or target_project.deleted_at is not None:
+            return Response(
+                {"error": "Target project is archived or deleted"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # --- Source project -------------------------------------------------
         source_project = Project.objects.filter(pk=project_id, workspace__slug=slug).first()
         if source_project is None:
             return Response({"error": "Project not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Adversarial review F3: archived/deleted projects would silently bury
+        # the moved issues (IssueManager excludes archived projects).
+        if source_project.archived_at is not None or source_project.deleted_at is not None:
+            return Response(
+                {"error": "Source project is archived or deleted"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         # Single-workspace fork: cross-workspace targets are not allowed.
         if target_project.workspace_id != source_project.workspace_id:
@@ -321,28 +347,44 @@ class IssueMoveEndpoint(BaseAPIView):
                 .first()
             )
 
-            for moving in moved_issues:
+            # Performance review: resolve remapped states and sort-order bases
+            # for the whole subtree ONCE instead of 2 aggregate queries per
+            # moved issue inside the lock hold.
+            new_states = [_remap_state(m, target_project.id) for m in moved_issues]
+            sort_base = {}
+            for state in set(new_states):
+                if state is None:
+                    continue
+                largest = Issue.objects.filter(
+                    project_id=target_project.id, state=state
+                ).aggregate(largest=Max("sort_order"))["largest"]
+                sort_base[state.id] = (
+                    largest + 10000 if largest is not None else 65535.0
+                )
+            next_sequence = (
+                IssueSequence.objects.filter(project_id=target_project.id).aggregate(
+                    largest=Max("sequence")
+                )["largest"]
+                or 0
+            ) + 1
+
+            for moving, new_state in zip(moved_issues, new_states):
                 # 4. State remap (completed_at syncs via Issue.save's _sync_completed_at)
-                new_state = _remap_state(moving, target_project.id)
 
                 # 7. Type remap: only types linked to the destination project stay
                 new_type_id = moving.type_id
                 if new_type_id is not None and new_type_id not in dest_type_ids:
                     new_type_id = dest_default_type_id
 
-                # 2. Sequence reassignment: max(dest) + 1
-                new_sequence = (
-                    IssueSequence.objects.filter(project_id=target_project.id).aggregate(
-                        largest=Max("sequence")
-                    )["largest"]
-                    or 0
-                ) + 1
+                # 2. Sequence reassignment: next in line (counter seeded from
+                # the max above; the advisory lock serializes allocation)
+                new_sequence = next_sequence
+                next_sequence += 1
 
                 # 9. sort_order recomputed per destination project + state
-                largest_sort_order = Issue.objects.filter(
-                    project_id=target_project.id, state=new_state
-                ).aggregate(largest=Max("sort_order"))["largest"]
-                new_sort_order = largest_sort_order + 10000 if largest_sort_order is not None else 65535.0
+                new_sort_order = sort_base[new_state.id] if new_state else 65535.0
+                if new_state is not None:
+                    sort_base[new_state.id] = new_sort_order + 10000
 
                 is_root = moving.pk == issue.pk
                 moving.state = new_state
@@ -373,38 +415,49 @@ class IssueMoveEndpoint(BaseAPIView):
             root = next(m for m in moved_issues if m.pk == issue.pk)
 
             # 5. Labels: workspace-level labels are kept as-is. Project labels
-            #    of the source project are ADOPTED into the destination (the
-            #    Label row is re-pointed) so moved work items keep their labels
-            #    (decision amendment 2026-09-11 on request); if the destination
-            #    already has a same-named label, the bridge row is dropped
-            #    instead to respect the (project, name) uniqueness. Labels
-            #    already scoped to the destination stay untouched. Label
-            #    hierarchy parents not attached to a moved issue stay in the
-            #    source (cosmetic cross-project parent; acceptable).
-            # 5. Labels: workspace-level labels stay as-is. Project labels of
-            #    the source project travel with the moved items via CLONES:
+            #    of the source project travel with the moved items via CLONES:
             #    a destination Label row is created with the same name/color
             #    and only the moved issues' bridge rows are re-pointed to it —
             #    the original label row stays behind, so source issues that
             #    share the label keep it (security review: re-pointing the
             #    shared row stripped the label from non-moved source issues).
             #    If the destination already has a same-named label, the moved
-            #    issues are merged onto it instead (no duplicates).
-            source_label_ids = sorted(
-                set(
-                    IssueLabel.objects.filter(issue_id__in=moving_ids)
-                    .filter(label__project_id=source_project.id, label__deleted_at__isnull=True)
-                    .values_list("label_id", flat=True)
-                )
+            #    issues are merged onto it instead (no duplicates). Labels are
+            #    processed parents-first so child clones can re-attach to
+            #    their travelling parent clone (adversarial review F2).
+            source_label_ids = list(
+                IssueLabel.objects.filter(issue_id__in=moving_ids)
+                .filter(label__project_id=source_project.id, label__deleted_at__isnull=True)
+                .values_list("label_id", flat=True)
             )
+            source_labels = {l.pk: l for l in Label.objects.filter(pk__in=source_label_ids)}
+            # Parents-first ordering within the travelling label set.
+            ordered_label_ids = []
+            placed = set()
+            while len(ordered_label_ids) < len(source_label_ids):
+                progressed = False
+                for sid in source_label_ids:
+                    if sid in placed:
+                        continue
+                    parent_id = source_labels[sid].parent_id
+                    if parent_id is None or parent_id not in source_label_ids or parent_id in placed:
+                        ordered_label_ids.append(sid)
+                        placed.add(sid)
+                        progressed = True
+                if not progressed:
+                    # Cycle guard: append whatever is left.
+                    ordered_label_ids.extend(sid for sid in source_label_ids if sid not in placed)
+                    break
             label_id_map = {}
-            for source_label_id in source_label_ids:
-                source_label = Label.objects.get(pk=source_label_id)
+            for source_label_id in ordered_label_ids:
+                source_label = source_labels[source_label_id]
                 twin = Label.objects.filter(
                     project_id=target_project.id, deleted_at__isnull=True, name=source_label.name
                 ).first()
                 if twin is not None:
-                    # Merge onto the destination twin.
+                    # Merge onto the destination twin (adversarial review F5:
+                    # dedupe any bridges already pointing at the twin first).
+                    IssueLabel.objects.filter(issue_id__in=moving_ids, label_id=twin.id).delete()
                     label_id_map[source_label_id] = twin.id
                     IssueLabel.objects.filter(issue_id__in=moving_ids, label_id=source_label_id).update(
                         label_id=twin.id
@@ -477,22 +530,26 @@ class IssueMoveEndpoint(BaseAPIView):
             #     (workspace unchanged). IssueSequence is excluded on purpose:
             #     the old source rows are kept as historical records (item 2)
             #     and the new destination rows are already project-scoped.
-            IssueActivity.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueComment.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueLink.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueAttachment.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueSubscriber.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueReaction.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueVote.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueMention.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
+            #     Chunked: IN-lists stay below the PostgreSQL bind-parameter
+            #     limit for very large subtrees (adversarial review F1).
+            for model in (
+                IssueActivity,
+                IssueComment,
+                IssueLink,
+                IssueAttachment,
+                IssueSubscriber,
+                IssueReaction,
+                IssueVote,
+                IssueMention,
+                IssueVersion,
+                IssueDescriptionVersion,
+                GithubIssueSync,
+            ):
+                for chunk in _chunked(moving_ids):
+                    model.objects.filter(issue_id__in=chunk).update(project_id=target_project.id)
             CommentReaction.objects.filter(comment__issue_id__in=moving_ids).update(
                 project_id=target_project.id
             )
-            IssueVersion.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
-            IssueDescriptionVersion.objects.filter(issue_id__in=moving_ids).update(
-                project_id=target_project.id
-            )
-            GithubIssueSync.objects.filter(issue_id__in=moving_ids).update(project_id=target_project.id)
             GithubCommentSync.objects.filter(comment__issue_id__in=moving_ids).update(
                 project_id=target_project.id
             )
@@ -589,4 +646,8 @@ class IssueMoveEndpoint(BaseAPIView):
             Issue.all_objects.filter(pk=root.id, deleted_at__isnull=True)
         ).first()
         serializer = IssueSerializer(root)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        # Adversarial review F4: the frontend removes EVERY moved item from its
+        # source store, so enumerate the subtree for it.
+        response_data = serializer.data
+        response_data["moved_ids"] = [str(mid) for mid in moving_ids]
+        return Response(response_data, status=status.HTTP_200_OK)

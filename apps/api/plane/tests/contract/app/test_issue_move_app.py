@@ -642,6 +642,7 @@ class TestIssueMove:
         assert set(data["label_ids"]) == {str(ws_label.id), str(cloned_label.id)}
         assert set(data["assignee_ids"]) == {str(kept_user.id)}
         assert data["estimate_point"] is None
+        assert data["moved_ids"] == [str(root.id)]
         assert data["sort_order"] > dst_done_existing.sort_order
         # The annotation mirrors apply_annotations: no children -> NULL
         assert not data["sub_issues_count"]

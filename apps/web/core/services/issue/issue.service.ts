@@ -302,8 +302,14 @@ export class IssueService extends APIService {
 
   // Questimus fork change (QUESTIMUS-30): move a work item (and its whole
   // sub-tree) to another project. Response is the moved root issue serialized
-  // with its new project_id/sequence_id.
-  async moveIssue(workspaceSlug: string, projectId: string, issueId: string, targetProjectId: string): Promise<TIssue> {
+  // with its new project_id/sequence_id, plus moved_ids (every moved issue id)
+  // so the store can purge the whole subtree from the source view.
+  async moveIssue(
+    workspaceSlug: string,
+    projectId: string,
+    issueId: string,
+    targetProjectId: string
+  ): Promise<TIssue & { moved_ids?: string[] }> {
     return this.post(`/api/workspaces/${workspaceSlug}/projects/${projectId}/issues/${issueId}/move/`, {
       target_project_id: targetProjectId,
     })
